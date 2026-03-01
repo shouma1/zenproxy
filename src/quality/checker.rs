@@ -7,6 +7,10 @@ use tokio::time::Instant;
 
 /// Staleness threshold: re-check quality after 24 hours.
 const STALE_HOURS: i64 = 24;
+/// Incomplete quality data can be retried at most this many times.
+const MAX_INCOMPLETE_RETRIES: u8 = 2;
+/// Limit checks per run so quality task won't hold validation resources for too long.
+const MAX_QUALITY_CHECKS_PER_RUN: usize = 40;
 
 /// ip-api.com rate limiter: max 40 requests/minute (free tier limit is 45).
 struct RateLimiter {
@@ -34,76 +38,73 @@ impl RateLimiter {
 
 /// Returns the number of proxies actually checked.
 pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
-    // Serialize with validation — wait if validation/quality check is running
-    let _lock = state.validation_lock.lock().await;
-
     let now = chrono::Utc::now();
     let mut total_checked = 0usize;
-    let mut round = 0u32;
-    let mut did_reassign = false;
-
     let rate_limiter = Arc::new(RateLimiter::new(40));
 
-    loop {
-        round += 1;
+    // Hold lock only for short binding-selection work.
+    let (mut to_check, did_reassign) = {
+        let _lock = state.validation_lock.lock().await;
+        let mut did_reassign = false;
 
-        // Check all valid proxies with ports that need quality checking
-        let proxies = state.pool.get_valid_proxies();
-        let to_check: Vec<PoolProxy> = proxies
+        let mut to_check: Vec<PoolProxy> = state
+            .pool
+            .get_valid_proxies()
             .into_iter()
             .filter(|p| p.local_port.is_some())
             .filter(|p| needs_quality_check(p, &now))
             .collect();
 
-        if !to_check.is_empty() {
-            tracing::info!(
-                "Quality check round {round}: checking {} proxies",
-                to_check.len()
-            );
-            total_checked += check_batch(&to_check, &state, &rate_limiter).await;
+        if to_check.is_empty() {
+            let remaining_without_port = state
+                .pool
+                .get_valid_proxies()
+                .into_iter()
+                .filter(|p| p.local_port.is_none() && needs_quality_check(p, &now))
+                .count();
+
+            if remaining_without_port > 0 {
+                tracing::info!(
+                    "Quality check: {remaining_without_port} valid proxies need checking but have no port, reassigning once"
+                );
+                crate::api::subscription::sync_proxy_bindings(
+                    &state,
+                    crate::api::subscription::SyncMode::QualityCheck,
+                )
+                .await;
+                did_reassign = true;
+
+                to_check = state
+                    .pool
+                    .get_valid_proxies()
+                    .into_iter()
+                    .filter(|p| p.local_port.is_some())
+                    .filter(|p| needs_quality_check(p, &now))
+                    .collect();
+            }
         }
 
-        // Any valid proxies still needing check but without ports?
-        let remaining = state
-            .pool
-            .get_valid_proxies()
-            .into_iter()
-            .filter(|p| p.local_port.is_none() && needs_quality_check(p, &now))
-            .count();
+        (to_check, did_reassign)
+    };
 
-        if remaining == 0 {
-            break;
+    if !to_check.is_empty() {
+        if to_check.len() > MAX_QUALITY_CHECKS_PER_RUN {
+            to_check.truncate(MAX_QUALITY_CHECKS_PER_RUN);
         }
-
-        // Reassign ports to give unchecked proxies a chance
         tracing::info!(
-            "Quality check: {remaining} valid proxies still need checking, reassigning ports"
+            "Quality check: checking {} proxies this run (limit={MAX_QUALITY_CHECKS_PER_RUN})",
+            to_check.len()
         );
-        crate::api::subscription::sync_proxy_bindings(&state, crate::api::subscription::SyncMode::QualityCheck).await;
-        did_reassign = true;
-
-        // Verify reassignment actually produced checkable proxies
-        let new_available = state
-            .pool
-            .get_valid_proxies()
-            .into_iter()
-            .filter(|p| p.local_port.is_some() && needs_quality_check(p, &now))
-            .count();
-        if new_available == 0 {
-            tracing::warn!("Port reassignment didn't yield checkable proxies, stopping");
-            break;
-        }
+        total_checked += check_batch(&to_check, &state, &rate_limiter).await;
     }
 
-    // Restore normal port assignment if we reassigned ports
     if did_reassign {
+        let _lock = state.validation_lock.lock().await;
         crate::api::subscription::sync_proxy_bindings(&state, crate::api::subscription::SyncMode::Normal).await;
     }
 
     if total_checked > 0 {
-        tracing::info!(
-            "Quality check complete: {total_checked} proxies checked in {round} round(s)"
-        );
+        tracing::info!("Quality check complete: {total_checked} proxies checked in this run");
     }
 
     Ok(total_checked)
@@ -134,6 +135,18 @@ async fn check_batch(
             let proxy_addr = format!("http://127.0.0.1:{local_port}");
             match check_single(&proxy_addr, &proxy, &rl).await {
                 Ok(quality) => {
+                    let is_incomplete = quality_is_incomplete(&quality);
+                    let incomplete_retry_count = if is_incomplete {
+                        proxy
+                            .quality
+                            .as_ref()
+                            .map(|q| q.incomplete_retry_count)
+                            .unwrap_or(0)
+                            .saturating_add(1)
+                    } else {
+                        0
+                    };
+
                     tracing::info!(
                         "Quality OK: {} | IP={} country={} type={} residential={} google={} chatgpt={} risk={}({})",
                         proxy.name,
@@ -156,11 +169,18 @@ async fn check_batch(
                         google_accessible: quality.google_accessible,
                         risk_score: quality.risk_score,
                         risk_level: quality.risk_level.clone(),
-                        extra_json: None,
+                        extra_json: Some(
+                            serde_json::json!({
+                                "incomplete_retry_count": incomplete_retry_count,
+                            })
+                            .to_string(),
+                        ),
                         checked_at: chrono::Utc::now().to_rfc3339(),
                     };
                     state.db.upsert_quality(&db_quality).ok();
-                    state.pool.set_quality(&proxy.id, quality);
+                    let mut quality_to_pool = quality;
+                    quality_to_pool.incomplete_retry_count = incomplete_retry_count;
+                    state.pool.set_quality(&proxy.id, quality_to_pool);
                 }
                 Err(e) => {
                     tracing::warn!("Quality check failed for {}: {e}", proxy.name);
@@ -185,7 +205,10 @@ fn needs_quality_check(proxy: &PoolProxy, now: &chrono::DateTime<chrono::Utc>) -
         None => true,
         Some(q) => {
             // Incomplete data → retry
-            if q.country.is_none() || q.ip_type.is_none() || q.ip_address.is_none() || q.risk_level == "Unknown" {
+            if quality_is_incomplete(q) {
+                if q.incomplete_retry_count >= MAX_INCOMPLETE_RETRIES {
+                    return false;
+                }
                 return true;
             }
             match &q.checked_at {
@@ -202,6 +225,10 @@ fn needs_quality_check(proxy: &PoolProxy, now: &chrono::DateTime<chrono::Utc>) -
             }
         }
     }
+}
+
+fn quality_is_incomplete(q: &ProxyQualityInfo) -> bool {
+    q.country.is_none() || q.ip_type.is_none() || q.ip_address.is_none() || q.risk_level == "Unknown"
 }
 
 /// IP info from ip-api.com (primary source — free, no key, auto-detects caller IP)
